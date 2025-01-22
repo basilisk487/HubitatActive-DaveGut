@@ -14,6 +14,7 @@ metadata {
                 author: "Dave Gutheinz",
                 importUrl: "https://raw.githubusercontent.com/DaveGut/HubitatActive/master/KasaDevices/DeviceDrivers/ColorBulb.groovy"
                ) {
+        capability "Initialize"
         capability "Light"
         capability "Switch"
         capability "Switch Level"
@@ -43,8 +44,10 @@ metadata {
         command "setPollInterval", [[
             name: "Poll Interval in seconds",
             constraints: ["default", "1 minute", "5 minutes",  "10 minutes",
-                          "30 minutes"],
+                          "30 minutes", "1 hour", "3 hours", "6 hours",
+                          "12 hours", "24 hours"],
             type: "ENUM"]]
+        command "resetCounters"
         capability "Power Meter"
         capability "Energy Meter"
         attribute "currMonthTotal", "number"
@@ -61,6 +64,9 @@ metadata {
         input ("logEnable", "bool",
                title: "Enable debug logging",
                defaultValue: false)
+        input ("logTiming", "bool",
+                title: "Enable logging of operation latencies",
+                defaultValue: true)
         input ("transition_Time", "number",
                title: "Default Transition time (seconds)",
                defaultValue: 1)
@@ -72,9 +78,18 @@ metadata {
                defaultValue: false)
         if (emFunction) {
             input ("energyPollInt", "enum",
-                   title: "Energy Poll Interval (minutes)",
-                   options: ["1 minute", "5 minutes", "30 minutes"],
-                   defaultValue: "30 minutes")
+                    title: "Energy Poll Interval (minutes)",
+                    options: ["never", "1 minute", "5 minutes", "30 minutes", "1 hour", "3 hours", "6 hours", "12 hours"],
+                    defaultValue: "never")
+            input ("realtimePollInt", "enum",
+                    title: "Realtime Energy Poll Interval (seconds)",
+                    options: ["never", "15 seconds", "30 seconds", "1 minute", "5 minutes", "30 minutes"],
+                    defaultValue: "5 minutes")
+        }
+        if (getDataValue("deviceIP") != "CLOUD") {
+            input ("altLan", "bool",
+                    title: "Alternate LAN Comms (for comms problems only)",
+                    defaultValue: false)
         }
         input ("bind", "bool",
                title: "Kasa Cloud Binding",
@@ -97,6 +112,11 @@ metadata {
                title: "Reboot device <b>[Caution]</b>",
                defaultValue: false)
     }
+}
+
+def initialize() {
+    interfaces.rawSocket.close()
+    state.connected = false
 }
 
 def installed() {
@@ -281,6 +301,10 @@ def updateCommon() {
     state.remove("releaseNotes")
     removeDataValue("driverVersion")
     if (emFunction) {
+        if (energyPollInt == null) { energyPollInt = "never" }
+        updStatus << [energyPollInt: setEnergyPollInterval(energyPollInt)]
+        if (realtimePollInt == null) { realtimePollInt = "never" }
+        updStatus << [realtimePollInt: setRealtimePollInterval(realtimePollInt)]
         scheduleEnergyAttrs()
         state.getEnergy = "This Month"
         updStatus << [emFunction: "scheduled"]
@@ -305,23 +329,14 @@ def poll() { getSysinfo() }
 def setPollInterval(interval = state.pollInterval) {
     if (interval == "default" || interval == "off" || interval == null) {
         interval = "30 minutes"
-    } else if (useCloud || altLan || getDataValue("altComms") == "true") {
+    } else if (useCloud) {
         if (interval.contains("sec")) {
             interval = "1 minute"
-            logWarn("setPollInterval: Device using Cloud or rawSocket.  Poll interval reset to minimum value of 1 minute.")
+            logWarn("setPollInterval: Device using Cloud.  Poll interval reset to minimum value of 1 minute.")
         }
     }
     state.pollInterval = interval
-    def pollInterval = interval.substring(0,2).toInteger()
-    if (interval.contains("sec")) {
-        def start = Math.round((pollInterval-1) * Math.random()).toInteger()
-        schedule("${start}/${pollInterval} * * * * ?", "poll")
-        logWarn("setPollInterval: Polling intervals of less than one minute " +
-                "can take high resources and may impact hub performance.")
-    } else {
-        def start = Math.round(59 * Math.random()).toInteger()
-        schedule("${start} */${pollInterval} * * * ?", "poll")
-    }
+    scheduleMethodEvery("poll", interval)
     logDebug("setPollInterval: interval = ${interval}.")
     return interval
 }
@@ -521,10 +536,12 @@ def sendCmd(command) {
     def connection = device.currentValue("connection")
     if (connection == "LAN") {
         sendLanCmd(command)
+        setTimerFlag("udp")
     } else if (connection == "CLOUD") {
         sendKasaCmd(command)
     } else if (connection == "AltLAN") {
         sendTcpCmd(command)
+        setTimerFlag("tcp")
     } else {
         logWarn("sendCmd: attribute connection is not set.")
     }
@@ -540,7 +557,7 @@ def sendLanCmd(command) {
          destinationAddress: "${getDataValue("deviceIP")}:${getPort()}",
          encoding: hubitat.device.HubAction.Encoding.HEX_STRING,
          parseWarning: true,
-         timeout: 9,
+         timeout: 60,
          ignoreResponse: false,
          callback: "parseUdp"])
     try {
@@ -551,6 +568,7 @@ def sendLanCmd(command) {
     }
 }
 def parseUdp(message) {
+    checkTimerFlag("udp")
     def resp = parseLanMessage(message)
     if (resp.type == "LAN_TYPE_UDPCLIENT") {
         def clearResp = inputXOR(resp.payload)
@@ -572,7 +590,7 @@ def parseUdp(message) {
         distResp(cmdResp)
         setCommsError(false)
     } else {
-        logDebug("parseUdp: [error: error, reason: not LAN_TYPE_UDPCLIENT, respType: ${resp.type}]")
+        logWarn("parseUdp: [error: error, reason: not LAN_TYPE_UDPCLIENT, respType: ${resp.type}]")
         handleCommsError()
     }
 }
@@ -627,24 +645,27 @@ def cloudParse(resp, data = null) {
 
 def sendTcpCmd(command) {
     logDebug("sendTcpCmd: ${command}")
-    try {
-        interfaces.rawSocket.connect("${getDataValue("deviceIP")}",
-                                     getPort().toInteger(), byteInterface: true)
-    } catch (error) {
-        logDebug("SendTcpCmd: [connectFailed: [ip: ${getDataValue("deviceIP")}, Error = ${error}]]")
-    }
     state.response = ""
+    if (!state.connected) {
+        tcpReconnect()
+    }
+    if (!state.pendingCommands) {
+        state.pendingCommands = []
+    }
     interfaces.rawSocket.sendMessage(outputXorTcp(command))
 }
-def close() { interfaces.rawSocket.close() }
+
 def socketStatus(message) {
-    if (message != "receive error: Stream closed.") {
-        logDebug("socketStatus: Socket Established")
+    if (message == "receive error: Stream closed." || message == "send error: Broken pipe (Write failed)") {
+        logInfo("${message}, resetting socket")
+        interfaces.rawSocket.close()
+        state.connected = false
     } else {
-        logWarn("socketStatus = ${message}")
+        logInfo("socketStatus = ${message}")
     }
 }
 def parse(message) {
+    checkTimerFlag("tcp")
     if (message != null || message != "") {
         def response = state.response.concat(message)
         state.response = response
@@ -655,15 +676,25 @@ def extractTcpResp(response) {
     def cmdResp
     def clearResp = inputXorTcp(response)
     if (clearResp.endsWith("}}}")) {
-        interfaces.rawSocket.close()
         try {
             cmdResp = parseJson(clearResp)
             distResp(cmdResp)
+
         } catch (e) {
             logWarn("extractTcpResp: [length: ${clearResp.length()}, clearResp: ${clearResp}, comms error: ${e}]")
         }
+        state.response = ""
+        if (state.pendingCommands.size() > 0) {
+            logInfo("${state.pendingCommands.size()} pending commands, removing one")
+            state.pendingCommands.removeAt(0)
+        }
     } else if (clearResp.length() > 2000) {
-        interfaces.rawSocket.close()
+        logInfo("clearResp length is more than 2000 but no termination, ignoring")
+        if (state.pendingCommands.size() > 0) {
+            state.pendingCommands.removeAt(0)
+        }
+    } else {
+        logInfo("waiting for more messages")
     }
 }
 
@@ -677,8 +708,8 @@ def handleCommsError() {
         def count = state.errorCount + 1
         state.errorCount = count
         def retry = true
-        def cmdData = new JSONObject(state.lastCmd)
-        def cmdBody = parseJson(cmdData.cmdBody.toString())
+        def cmdData = new JSONObject(state.lastCommand)
+        def cmdBody = parseJson(cmdData.toString())
         logData << [count: count, command: state.lastCommand]
         switch (count) {
             case 1:
@@ -1125,19 +1156,27 @@ def setupEmFunction() {
     }
 }
 
+def setEnergyPollInterval(energyPollInt) {
+    unschedule("getEnergyToday")
+    state.energyPollInt = energyPollInt
+    if (energyPollInt == null || energyPollInt == "never") {
+        return
+    }
+    scheduleMethodEvery("getEnergyToday", energyPollInt)
+}
+
+def setRealtimePollInterval(realtimePollInt) {
+    unschedule("getPower")
+    state.realtimePollInt = realtimePollInt
+    if (realtimePollInt == null || realtimePollInt == "never") {
+        return
+    }
+    scheduleMethodEvery("getPower", realtimePollInt)
+}
+
 def scheduleEnergyAttrs() {
     schedule("10 0 0 * * ?", getEnergyThisMonth)
     schedule("15 2 0 1 * ?", getEnergyLastMonth)
-    switch(energyPollInt) {
-        case "1 minute":
-            runEvery1Minute(getEnergyToday)
-            break
-        case "5 minutes":
-            runEvery5Minutes(getEnergyToday)
-            break
-        default:
-            runEvery30Minutes(getEnergyToday)
-    }
 }
 
 def zeroizeEnergyAttrs() {
@@ -1367,3 +1406,89 @@ def getMonthstat(year) {
 }
 
 // ~~~~~ end include (1361) davegut.kasaEnergyMonitor ~~~~~
+
+def setTimerFlag(key) {
+    def flag = "last${key}Requested"
+    if (state[flag]) {
+        state.commandsLost = (state.commandsLost ?: 0) + 1;
+        if (!altLan) {
+            logError("previous ${key} command lost!")
+        }
+    }
+    state[flag] = now();
+}
+
+def checkTimerFlag(key) {
+    def flag = "last${key}Requested"
+    if (state[flag]) {
+        state.recordedOps = (state.recordedOps ?: 0) + 1
+        def latency = now() - state[flag];
+        if (latency > 1000) {
+            state.highLatencyOps = (state.highLatencyOps ?: 0) + 1
+            logWarn("High ${key} latency: ${latency}ms")
+        } else {
+            if (logTiming) {
+                logInfo("${key} latency: ${latency}ms")
+            }
+        }
+        //state.remove(flag);
+        state[flag] = null;
+    }
+}
+
+def resetCounters() {
+    state.remove("recordedOps")
+    state.remove("highLatencyOps")
+    state.remove("commandsLost")
+    state.remove("lastEmeterRequested")
+    state.remove("lastSysinfoRequested")
+    state.remove("lastRelayStateRequested")
+    state.remove("pendingCommands")
+}
+
+def logError(msg) { log.error "${device.displayName}-${driverVer()}: ${msg}" }
+
+def scheduleMethodEvery(method, interval) {
+    def pollInterval = interval.substring(0,2).toInteger()
+    if (interval.contains("sec")) {
+        def start = Math.round((pollInterval-1) * Math.random()).toInteger()
+        schedule("${start}/${pollInterval} * * * * ?", method)
+    } else if (interval.contains("min")) {
+        def start = Math.round(59 * Math.random()).toInteger()
+        def offsetMinutes = new Random().nextInt(pollInterval)
+        schedule("${start} ${offsetMinutes}-59/${pollInterval} * * * ?", "poll")
+    } else {
+        def start = Math.round(59 * Math.random()).toInteger()
+        def offsetMinutes = new Random().nextInt(60)
+        def offsetHours = new Random().nextInt(pollInterval)
+        schedule("${start} ${offsetMinutes} ${offsetHours}-23/${pollInterval} * * ?", "poll")
+    }
+}
+
+def tcpReconnect() {
+    if (state.connected) {
+        logInfo("resetting socket")
+        interfaces.rawSocket.close()
+    }
+    logInfo("connecting...")
+    try {
+        interfaces.rawSocket.connect([ timeout: 300_000, byteInterface: true, readDelay: 300], "${getDataValue("deviceIP")}",
+                getPort().toInteger())
+        state.connected = true
+    } catch (error) {
+        logInfo("SendTcpCmd: [connectFailed: [ip: ${getDataValue("deviceIP")}, Error = ${error}]]")
+        state.connected = false
+    }
+    if (state.connected) {
+        cmds = []
+        for (pc in state.pendingCommands) {
+            cmds.add(pc)
+        }
+        state.remove("pendingCommands")
+        for (v in cmds) {
+            logInfo("re-sending command: ${v}")
+            sendTcpCmd(v)
+            pauseExecution(500)
+        }
+    }
+}
